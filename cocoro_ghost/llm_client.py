@@ -191,11 +191,16 @@ class LlmClient:
         payload: Any,
         model: str,
         stream: bool,
+        debug_label: Optional[str] = None,
     ) -> None:
         """LLM受信ログを出す。"""
         self.logger.info("LLMから受信", extra={"model": model, "stream": stream, "kind": kind})
         if self.logger.isEnabledFor(logging.DEBUG):
-            log_llm_payload(self.logger, f"LLM response ({kind})", payload)
+            if payload is None:
+                label = debug_label or kind
+                self.logger.debug("LLM response (%s)", label)
+            else:
+                log_llm_payload(self.logger, f"LLM response ({kind})", payload)
 
     def _build_completion_kwargs(
         self,
@@ -364,7 +369,7 @@ class LlmClient:
 
         self._log_llm_send(kind="embedding", payload=kwargs, model=self.embedding_model, stream=False)
         resp = litellm.embedding(**kwargs)
-        self._log_llm_recv(kind="embedding", payload=self.response_to_dict(resp), model=self.embedding_model, stream=False)
+        self._log_llm_recv(kind="embedding", payload=None, model=self.embedding_model, stream=False, debug_label="embedding data")
 
         # レスポンス形式に応じてベクトルを抽出
         try:

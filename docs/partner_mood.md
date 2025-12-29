@@ -11,22 +11,22 @@
 
 ## 全体像（2層）
 
-1) **即時（そのターン）**: `/api/chat` の同一LLM呼び出しで「返答本文 + 内部JSON（反射）」を生成し、内部JSONをサーバ側で回収して保存・反映する  
+1) **即時（そのターン）**: `/api/chat` の同一LLM呼び出しで「返答本文 + 内部メタJSON（tool call）」を生成し、メタをサーバ側で回収して保存・反映する  
 2) **持続（次ターン以降）**: 過去エピソードの反射値を「重要度×時間減衰」で積分し、現在の機嫌（mood）を推定して `CONTEXT_CAPSULE` に注入する
 
-## 即時反応（partner_affect trailer）
+## 即時反応（partner_affect meta / tool call）
 
 ### 出力形式（LLM → サーバ）
 
-`/api/chat` では、返答本文の直後に次の区切り文字を1行で出力し、その次行に JSON を1つだけ出力します。
+`/api/chat` では、返答本文は通常どおりストリームしつつ、内部メタは **原則として** function tool `cocoro_emit_partner_affect_meta` を **1回だけ** 呼び出して報告します。
 
-- 区切り文字: `<<<COCORO_GHOST_PARTNER_AFFECT_JSON_v1>>>`
+ただしモデル/バックエンド都合で tool call が出ない・壊れる可能性はゼロにできないため、サーバ側の回収は best-effort とします（本文SSEを優先）。
 
-サーバ側は区切り以降を **SSEに流さず** 回収し、`units` / `payload_episode` に即時反映します（実装: `cocoro_ghost/memory.py`）。
+サーバ側は tool call の `arguments` を回収し、`units` / `payload_episode` に即時反映します（実装: `cocoro_ghost/memory.py`）。
 
-### 内部JSON（partner_affect trailer）
+### 内部メタJSON（partner_affect meta）
 
-JSONスキーマは `docs/prompts.md` の「chat（SSE）: 返答末尾の内部JSON（partner_affect trailer）」を参照してください。
+JSONスキーマは `docs/prompts.md` の「chat（SSE）: tool callで回収する内部メタ（partner_affect meta）」を参照してください。
 
 ## 持続（重要度×時間減衰の集約 → partner_mood）
 
@@ -87,9 +87,9 @@ JSONスキーマは `docs/prompts.md` の「chat（SSE）: 返答末尾の内部
 - `anger` は joy/sadness/anger/fear の積分（重要度×時間減衰）の結果を 0..1 に圧縮した値
 - 既定のゲートは `anger >= 0.75`
 
-2) **LLMの内部JSON（partner_affect trailer）による間接/直接の制御**
+2) **LLMの内部メタ（partner_affect meta）による間接/直接の制御**
 
-`/api/chat` の内部JSONは Episode に保存され、次ターン以降の機嫌計算に取り込まれます。
+`/api/chat` の内部メタJSONは Episode に保存され、次ターン以降の機嫌計算に取り込まれます。
 
 - 間接: `partner_affect_label/intensity/salience/confidence` によって `anger` が上がれば、結果として `refusal_allowed` が立ちやすくなる
 - 直接（上書き候補）: 内部JSONに `partner_response_policy.refusal_allowed` を含めた場合、
@@ -107,7 +107,7 @@ UI/デバッグ用途では `PUT /api/partner_mood` で `response_policy` を含
 
 - 保存（素材）:
   - `units.partner_affect_label` / `units.partner_affect_intensity` / `units.salience` / `units.confidence` / `units.topic_tags`
-  - `/api/chat` は partner_affect trailer で即時更新（`payload_episode.reflection_json` にも保存）
+  - `/api/chat` は partner_affect meta（tool call）で即時更新（`payload_episode.reflection_json` にも保存）
   - その他入口（notification/capture 等）は Worker `reflect_episode` が補完（反射済みならスキップ）
 - 注入:
   - 同期: `cocoro_ghost/memory_pack_builder.py::build_memory_pack()` が `CONTEXT_CAPSULE` に `partner_mood_state: {...}` を追加

@@ -20,7 +20,7 @@
 | `META_PROACTIVE_MESSAGE_SYSTEM_PROMPT` | `cocoro_ghost/prompts.py` | meta_request（指示+材料）から能動メッセージ生成 | `cocoro_ghost/memory.py::MemoryManager::_process_meta_request_async` | 同期風（API応答後のBackgroundTasks） |
 | `DEFAULT_PERSONA_ANCHOR` | `cocoro_ghost/prompts.py` | PersonaPreset の初期値（未設定時の雛形） | `cocoro_ghost/db.py`（settings初期化） | 起動時/初期化 |
 | `DEFAULT_PERSONA_ADDON` | `cocoro_ghost/prompts.py` | addon（personaの任意追加オプション）の初期値 | `cocoro_ghost/db.py`（settings初期化） | 起動時/初期化 |
-| `PARTNER_AFFECT_TRAILER_PROMPT`（inline） | `cocoro_ghost/memory.py` | chatの返答末尾に「内部JSON（反射/機嫌）」を付加し、SSEから除外して保存（即時反映） | `cocoro_ghost/memory.py::MemoryManager.stream_chat` | 同期（chat） |
+| `PARTNER_AFFECT_META_TOOL_PROMPT`（inline） | `cocoro_ghost/memory.py` | chat本文とは別に「内部メタJSON（反射/機嫌）」を tool call で（原則）報告させ、サーバ側で best-effort 回収して即時反映 | `cocoro_ghost/memory.py::MemoryManager.stream_chat` | 同期（chat） |
 | `IMAGE_SUMMARY_PROMPT`（inline） | `cocoro_ghost/llm_client.py` | 画像を短い日本語で要約（vision） | `cocoro_ghost/llm_client.py::LlmClient.generate_image_summary`（呼び出し: `cocoro_ghost/memory.py::MemoryManager::_summarize_images` / `cocoro_ghost/memory.py::MemoryManager.handle_capture`） | 同期（chat/capture）/ 同期風（notification/meta_request の BackgroundTasks） |
 
 補足:
@@ -39,7 +39,7 @@ flowchart TD
     IMGN --> PACKN["MemoryPack Builder: build_memory_pack()"]
     IMGM --> PACKM["MemoryPack Builder: build_memory_pack()"]
 
-    PACK --> SYS_CHAT["system = MemoryPack + PARTNER_AFFECT_TRAILER_PROMPT"]
+    PACK --> SYS_CHAT["system = MemoryPack + PARTNER_AFFECT_META_TOOL_PROMPT (+ tools)"]
     PACKN --> SYS_NOTIF["system = MemoryPack + EXTERNAL_SYSTEM_PROMPT"]
     PACKM --> SYS_META["system = MemoryPack + META_PROACTIVE_MESSAGE_SYSTEM_PROMPT"]
 
@@ -175,7 +175,7 @@ sequenceDiagram
   RET-->>API: relevant_episodes[]
   API->>SCH: build_memory_pack(persona, addon, facts, loops, evidence...)
   SCH-->>API: MemoryPack ([PERSONA_ANCHOR] / [SHARED_NARRATIVE] / ...)
-  Note over API: system = MemoryPack + PARTNER_AFFECT_TRAILER_PROMPT
+  Note over API: system = MemoryPack + PARTNER_AFFECT_META_TOOL_PROMPT (+ tools)
   API->>LLM: chat(system, conversation, user_text)\n(stream)
   LLM-->>API: streamed tokens
   API-->>UI: SSE stream
@@ -196,7 +196,7 @@ sequenceDiagram
 
 - Workerは `jobs(kind=...)` を1件ずつ処理し、**ジョブ種別ごとに必要なLLM呼び出しを行う**。
   - つまりプロンプトが複数あっても、基本は「1回の会話につき1回のLLM呼び出しで全部」ではなく、**ジョブに応じて複数回に分かれる**。
-- ただし `/api/chat` は「返答本文 + 内部JSON（反射）」を同一呼び出しで回収できるため、Workerの `reflect_episode` は **反射が既に保存済みなら冪等にスキップ**される（フォールバック用途）。
+- ただし `/api/chat` は「返答本文 + 内部メタJSON（tool call）」を同一呼び出しで回収できるため、Workerの `reflect_episode` は **反射が既に保存済みなら冪等にスキップ**される（フォールバック用途）。
 - 内蔵Workerは1本のスレッドで動く前提のため、**同一プロセス内では概ね直列**にジョブが進む（uvicorn multi-worker 等の多重起動は非対応）。
 
 #### 目安: 1エピソード（1回の会話保存）から増えうるLLM呼び出し回数
@@ -272,7 +272,7 @@ flowchart LR
 - Notification: `# notification ...` 形式に整形したテキスト（+ 画像要約）を `conversation=[{"role":"user","content":...}]` として渡す（`cocoro_ghost/memory.py`）。
 - Meta request: `# meta_request ...` 形式に整形したテキスト（instruction + payload + 画像要約）を渡す（`cocoro_ghost/memory.py`）。
 - Persona/Addon: settings の active preset から読み込まれ、MemoryPack Builderが persona を `[PERSONA_ANCHOR]` に注入し、addon はその末尾へ「追加オプション（任意）」として追記する（`cocoro_ghost/config.py` / `cocoro_ghost/memory_pack_builder.py`）。
-- Partner affect trailer（chatのみ）: 返答本文の末尾に区切り文字 `<<<COCORO_GHOST_PARTNER_AFFECT_JSON_v1>>>` + 内部JSON（Reflectionスキーマ準拠）を付加する。サーバ側は区切り以降をSSEに流さず回収し、`units.partner_affect_* / salience / confidence / topic_tags` と `payload_episode.reflection_json` に即時反映する（`cocoro_ghost/memory.py`）。これにより「その発言で反応する」を同ターンで実現しつつ、Workerの `reflect_episode` は冪等にスキップ可能になる。
+- Partner affect meta（chatのみ）: 本文は通常どおりSSEでストリームしつつ、function tool `cocoro_emit_partner_affect_meta` を（原則）1回だけ呼び出させ、内部メタJSON（Reflection+policy）をサーバ側で best-effort 回収する。回収したメタは `units.partner_affect_* / salience / confidence / topic_tags` と `payload_episode.reflection_json` に即時反映される（`cocoro_ghost/memory.py`）。tool call が出ない場合も本文は成立し、後段Workerが補完しうる。これにより「その発言で反応する」を同ターンで実現しつつ、Workerの `reflect_episode` は冪等にスキップ可能になる。
 - Person summary: `person_summary_refresh` は注入用の `summary_text` に加えて、`favorability_score`（パートナーAI→人物の好感度 0..1）を `summary_json` に保存する。Schedulerは現状 `summary_text` を注入するため、好感度は `summary_text` 先頭に1行で含める運用（`cocoro_ghost/worker.py::_handle_person_summary_refresh`）。
 - 画像要約（vision）: `images[].base64` を画像として渡し、「短い日本語で要約」したテキストを得る（`cocoro_ghost/llm_client.py::LlmClient.generate_image_summary`）。chat/notification/meta_request/capture の `payload_episode.image_summary` に保存される。
 

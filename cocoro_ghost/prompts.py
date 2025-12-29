@@ -56,6 +56,7 @@ FACT_EXTRACT_SYSTEM_PROMPT = """
 - 出力は JSON のみ（前後に説明文を付けない）
 - 不確実なら confidence を低くする
 - 個数は多すぎない（最大5件）
+- validity.from/to は UNIX秒（int）または null
 - 目的語（object）が「固有名（人物/組織/作品/プロジェクト等）」として扱える場合は、可能なら object を {type_label,name} で出す
   - object_text は「文章としての表現」を残したいときに使う（どちらか片方でもよい）
 
@@ -81,6 +82,7 @@ LOOP_EXTRACT_SYSTEM_PROMPT = """
 ルール:
 - 出力は JSON のみ（前後に説明文を付けない）
 - 個数は多すぎない（最大5件）
+- due_at は UNIX秒（int）または null
 
 {
   "loops": [

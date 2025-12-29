@@ -3,13 +3,15 @@
 作成日: 2025-12-29  
 対象リポジトリ: `cocoro_ghost`
 
-このファイルは、今回の会話で確定した要求・制約・判断理由を、これから設計/実装に入る前の「合意メモ」としてまとめる。
+このファイルは、今回の会話で確定した要求・制約・判断理由を、設計/実装に入る前の「合意メモ」としてまとめる。
+（更新メモ: 実装により、/api/chat は tool call 方式へ移行済み）
 
-## 背景（現状）
+## 背景（当時の現状）
 
 - LLM呼び出しは `litellm.completion()` を中心にしており、OpenAI `chat.completions` 互換の `messages` / `choices[0].message.content` / `delta.content` 前提が各所にある（`cocoro_ghost/llm_client.py`、`cocoro_ghost/memory.py` のSSE）。
 - JSON生成は `response_format={"type":"json_object"}` + 文字列修復（コードフェンス除去、末尾カンマ除去、制御文字エスケープ等）で「なんとか `json.loads` する」設計になっている（`cocoro_ghost/llm_client.py`）。
-- `/api/chat` は本文ストリームと同一のLLM呼び出しで、本文末尾に内部JSON（partner_affect trailer）を混在させて回収している（仕様: `docs/prompts.md`、実装: `cocoro_ghost/memory.py`）。
+- `/api/chat` は当時、本文末尾に内部JSON（partner_affect trailer）を混在させて回収していた（旧仕様）。
+  - 現在は function tool `cocoro_emit_partner_affect_meta` の tool call で回収する方式に移行済み。
 
 ## 主目的（今回のゴール）
 
@@ -64,7 +66,7 @@
 ## 決定事項（現時点での合意）
 
 - `/api/chat` は **1回呼び**で、本文ストリームを維持したまま、同期でメタ（反射/affect等）も回収する。
-- 「本文末尾に内部JSONを混在させる（partner_affect trailer）」方式は、あるべき姿ではないため **廃止方向**。
+- 「本文末尾に内部JSONを混在させる（partner_affect trailer）」方式は、あるべき姿ではないため **廃止**。
 - JSON出力は全面的に Structured Outputs（厳格スキーマ）へ寄せる。
 - Responses API は「今すぐ必須」ではない。必要が出たら後で検討する。
 
@@ -93,7 +95,7 @@
   - JSON系を “文字列修復→json.loads” から “スキーマで厳格に取得” に置換する核。
   - streaming時の tool call / function call の取り回し（イベント抽出）が必要になる可能性が高い。
 - `cocoro_ghost/memory.py`
-  - `/api/chat` の partner_affect trailer 回収ロジックを撤去し、新方式（tool call等）へ。
+  - `/api/chat` の partner_affect trailer 回収ロジックを撤去し、tool call 方式へ移行する。
   - SSEのイベント設計（token / meta / done）を整理。
 - `cocoro_ghost/worker.py`, `cocoro_ghost/memory_pack_builder.py`
   - `json.loads(llm_client.response_content(resp))` 前提箇所を置換し、構造化結果を直接受け取る形へ。
@@ -104,4 +106,3 @@
 
 設計の中心は「**1回呼びのまま本文ストリームを維持し、メタJSONだけを厳格スキーマで同一リクエストから回収する**」。
 そのために、tool call / function calling を使った Structured Outputs 相当の実装を前提に詳細設計へ進む。
-

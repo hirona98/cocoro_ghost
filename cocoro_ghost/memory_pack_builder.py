@@ -101,17 +101,20 @@ def _fact_score(now: int, unit: Unit) -> float:
 
 def _extract_entity_names_with_llm(llm_client: "LlmClient", text: str) -> list[str]:
     from cocoro_ghost import prompts
+    from cocoro_ghost.llm_schemas import EntityNamesOnlyOutput
 
     # LLM抽出はベストエフォート。失敗してもスケジューリングは継続する。
     try:
         # ここは「names only」専用の軽量プロンプトを使う（roles/relationsの推測を避ける）。
-        resp = llm_client.generate_json_response(system_prompt=prompts.get_entity_names_only_prompt(), user_text=text)
-        raw = llm_client.response_content(resp)
-        data = json.loads(raw or "{}")
+        out = llm_client.generate_structured(
+            system_prompt=prompts.get_entity_names_only_prompt(),
+            user_text=text,
+            response_model=EntityNamesOnlyOutput,
+        )
     except Exception:  # noqa: BLE001
         return []
 
-    names_raw = data.get("names") or []
+    names_raw = out.names
     names: list[str] = []
     if isinstance(names_raw, list):
         for n in names_raw:

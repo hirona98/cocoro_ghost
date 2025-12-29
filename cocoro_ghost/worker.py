@@ -39,6 +39,15 @@ from cocoro_ghost import prompts
 from cocoro_ghost.config import get_config_store
 from cocoro_ghost.db import get_memory_session, sync_unit_vector_metadata, upsert_edges, upsert_unit_vector
 from cocoro_ghost.llm_client import LlmClient
+from cocoro_ghost.llm_schemas import (
+    BondSummaryOutput,
+    EntityExtractOutput,
+    FactExtractOutput,
+    LoopExtractOutput,
+    PersonSummaryOutput,
+    ReflectionOutput,
+    TopicSummaryOutput,
+)
 from cocoro_ghost.unit_enums import (
     EntityRole,
     JobStatus,
@@ -364,34 +373,23 @@ def _handle_reflect_episode(*, session: Session, llm_client: LlmClient, payload:
     context_text = "\n".join(ctx_parts)
 
     system_prompt = _wrap_prompt_with_persona(prompts.get_reflection_prompt())
-    resp = llm_client.generate_json_response(system_prompt=system_prompt, user_text=context_text)
-    raw_text = llm_client.response_content(resp)
-    raw_json = raw_text
-    data = json.loads(raw_text)
+    out = llm_client.generate_structured(
+        system_prompt=system_prompt,
+        user_text=context_text,
+        response_model=ReflectionOutput,
+    )
+    data = out.model_dump()
 
-    def _parse_clamped01(value: Any, default: float) -> float:
-        """0..1 の float として保守的に解釈し、範囲外は丸める。"""
-        if value is None:
-            return float(default)
-        if isinstance(value, bool):
-            return float(default)
-        try:
-            return clamp01(float(value))
-        except Exception:  # noqa: BLE001
-            return float(default)
-
-    unit.partner_affect_label = str(data.get("partner_affect_label") or "")
-    unit.partner_affect_intensity = _parse_clamped01(data.get("partner_affect_intensity"), 0.0)
-    unit.salience = _parse_clamped01(data.get("salience"), 0.0)
-    unit.confidence = _parse_clamped01(data.get("confidence"), 0.5)
-    topic_tags_raw = data.get("topic_tags")
-    topic_tags = topic_tags_raw if isinstance(topic_tags_raw, list) else []
-    canonical_tags = canonicalize_topic_tags(topic_tags)
+    unit.partner_affect_label = str(out.partner_affect_label or "")
+    unit.partner_affect_intensity = clamp01(out.partner_affect_intensity)
+    unit.salience = clamp01(out.salience)
+    unit.confidence = clamp01(out.confidence)
+    canonical_tags = canonicalize_topic_tags(out.topic_tags)
     data["topic_tags"] = canonical_tags
     unit.topic_tags = dumps_topic_tags_json(canonical_tags)
     unit.state = int(UnitState.VALIDATED)
     unit.updated_at = now_ts
-    pe.reflection_json = raw_json
+    pe.reflection_json = canonical_json_dumps(data)
     session.add(unit)
     session.add(pe)
     sync_unit_vector_metadata(
@@ -572,25 +570,20 @@ def _handle_extract_entities(*, session: Session, llm_client: LlmClient, payload
     if not text_in.strip():
         return
 
-    resp = llm_client.generate_json_response(system_prompt=prompts.get_entity_extract_prompt(), user_text=text_in)
-    data = json.loads(llm_client.response_content(resp))
-    entities = data.get("entities") or []
-    if not isinstance(entities, list):
-        return
+    out = llm_client.generate_structured(
+        system_prompt=prompts.get_entity_extract_prompt(),
+        user_text=text_in,
+        response_model=EntityExtractOutput,
+    )
 
-    for e in entities:
-        if not isinstance(e, dict):
-            continue
-        type_label = _normalize_type_label(str(e.get("type_label") or "").strip() or None)
-        name = str(e.get("name") or "").strip()
+    for e in out.entities:
+        type_label = _normalize_type_label(str(e.type_label or "").strip() or None)
+        name = str(e.name or "").strip()
         if not name:
             continue
-        aliases_raw = e.get("aliases") or []
-        if not isinstance(aliases_raw, list):
-            aliases_raw = []
-        aliases = [str(a) for a in aliases_raw if str(a).strip()]
-        roles = _normalize_roles(e.get("roles"), type_label=type_label)
-        confidence = float(e.get("confidence") or 0.0)
+        aliases = [str(a) for a in (e.aliases or []) if str(a).strip()]
+        roles = _normalize_roles(e.roles, type_label=type_label)
+        confidence = float(e.confidence or 0.0)
         ent = _get_or_create_entity(
             session,
             name=name,
@@ -659,20 +652,16 @@ def _handle_extract_entities(*, session: Session, llm_client: LlmClient, payload
     except Exception:  # noqa: BLE001
         logger.debug("failed to enqueue person/topic summary refresh", exc_info=True)
 
-    relations = data.get("relations") or []
-    if not isinstance(relations, list):
-        return
+    relations = out.relations
 
     # memory Session は autoflush=False のため、同一PKの Edge を複数 add() すると
     # commit時にまとめてINSERTされて UNIQUE 制約違反になりうる。
     # ここで重複を畳み込み、DB側も UPSERT で冪等にする。
     edge_rows_by_key: dict[tuple[int, str, int], dict] = {}
     for r in relations:
-        if not isinstance(r, dict):
-            continue
-        src_raw = str(r.get("src") or "")
-        dst_raw = str(r.get("dst") or "")
-        relation_raw = str(r.get("relation") or "")
+        src_raw = str(r.src or "")
+        dst_raw = str(r.dst or "")
+        relation_raw = str(r.relation or "")
         if not src_raw.strip() or not dst_raw.strip() or not relation_raw.strip():
             continue
 
@@ -684,7 +673,7 @@ def _handle_extract_entities(*, session: Session, llm_client: LlmClient, payload
         dst_type_label, dst_name = dst_parsed
         relation_label = _normalize_relation_label(relation_raw)
 
-        confidence = float(r.get("confidence") or 0.0)
+        confidence = float(r.confidence or 0.0)
         weight = max(0.1, confidence) if confidence > 0 else 1.0
 
         src_ent = _get_or_create_entity(
@@ -869,36 +858,31 @@ def _handle_extract_facts(*, session: Session, llm_client: LlmClient, payload: D
     if not text_in.strip():
         return
 
-    resp = llm_client.generate_json_response(system_prompt=prompts.get_fact_extract_prompt(), user_text=text_in)
-    data = json.loads(llm_client.response_content(resp))
-    facts = data.get("facts") or []
-    if not isinstance(facts, list):
-        return
+    out = llm_client.generate_structured(
+        system_prompt=prompts.get_fact_extract_prompt(),
+        user_text=text_in,
+        response_model=FactExtractOutput,
+    )
 
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        predicate = str(f.get("predicate") or "").strip()
-        obj_text_raw = f.get("object_text")
-        obj_text = str(obj_text_raw).strip() if obj_text_raw is not None else None
-        confidence = float(f.get("confidence") or 0.0)
+    for f in out.facts:
+        predicate = str(f.predicate or "").strip()
+        obj_text = str(f.object_text).strip() if f.object_text is not None else None
+        confidence = float(f.confidence or 0.0)
         if not predicate:
             continue
 
-        validity = f.get("validity")
         valid_from = None
         valid_to = None
-        if isinstance(validity, dict):
-            valid_from = _parse_optional_epoch_seconds(validity.get("from"))
-            valid_to = _parse_optional_epoch_seconds(validity.get("to"))
+        try:
+            valid_from = int(f.validity.from_) if f.validity.from_ is not None else None
+            valid_to = int(f.validity.to) if f.validity.to is not None else None
+        except Exception:  # noqa: BLE001
+            valid_from = None
+            valid_to = None
 
         subject_entity_id: Optional[int] = None
-        subj = f.get("subject")
-        subj_name = "USER"
-        subj_etype_raw = "PERSON"
-        if isinstance(subj, dict):
-            subj_name = str(subj.get("name") or "").strip() or "USER"
-            subj_etype_raw = _normalize_type_label(str(subj.get("type_label") or "").strip() or None) or "PERSON"
+        subj_name = str(f.subject.name or "").strip() or "USER"
+        subj_etype_raw = _normalize_type_label(str(f.subject.type_label or "").strip() or None) or "PERSON"
 
         if subj_name.strip().upper() == "USER":
             user_ent = _get_or_create_entity(
@@ -923,10 +907,9 @@ def _handle_extract_facts(*, session: Session, llm_client: LlmClient, payload: D
 
         # 目的語が固有名として扱える場合は Entity化して object_entity_id を埋める（ベストエフォート）
         object_entity_id: Optional[int] = None
-        obj = f.get("object")
-        if isinstance(obj, dict):
-            obj_name = str(obj.get("name") or "").strip()
-            obj_type_label = _normalize_type_label(str(obj.get("type_label") or "").strip() or None) or "OTHER"
+        if f.object is not None:
+            obj_name = str(f.object.name or "").strip()
+            obj_type_label = _normalize_type_label(str(f.object.type_label or "").strip() or None) or "OTHER"
             if obj_name:
                 obj_ent = _get_or_create_entity(
                     session,
@@ -1078,21 +1061,20 @@ def _handle_extract_loops(*, session: Session, llm_client: LlmClient, payload: D
         return
 
     system_prompt = _wrap_prompt_with_persona(prompts.get_loop_extract_prompt())
-    resp = llm_client.generate_json_response(system_prompt=system_prompt, user_text=text_in)
-    data = json.loads(llm_client.response_content(resp))
-    loops = data.get("loops") or []
-    if not isinstance(loops, list):
-        return
+    out = llm_client.generate_structured(
+        system_prompt=system_prompt,
+        user_text=text_in,
+        response_model=LoopExtractOutput,
+    )
 
-    for l in loops:
-        if not isinstance(l, dict):
-            continue
-        loop_text = str(l.get("loop_text") or "").strip()
+    for l in out.loops:
+        loop_text = str(l.loop_text or "").strip()
         if not loop_text:
             continue
-        status_raw = str(l.get("status") or "open").strip().lower()
+        status_raw = str(l.status or "open").strip().lower()
         status = int(LoopStatus.CLOSED) if status_raw in ("closed", "close") else int(LoopStatus.OPEN)
-        due_at = _parse_optional_epoch_seconds(l.get("due_at"))
+        due_at = int(l.due_at) if l.due_at is not None else None
+        confidence = float(l.confidence or 0.0)
 
         if status == int(LoopStatus.CLOSED):
             existing = (
@@ -1141,8 +1123,8 @@ def _handle_extract_loops(*, session: Session, llm_client: LlmClient, payload: D
                 if due_at is not None and pl.due_at != due_at:
                     pl.due_at = due_at
                     changed = True
-                if float(l.get("confidence") or 0.0) and float(unit.confidence or 0.0) != float(l.get("confidence") or 0.0):
-                    unit.confidence = float(l.get("confidence") or 0.0)
+                if confidence and float(unit.confidence or 0.0) != float(confidence):
+                    unit.confidence = float(confidence)
                     changed = True
                 if changed:
                     unit.updated_at = now_ts
@@ -1164,7 +1146,7 @@ def _handle_extract_loops(*, session: Session, llm_client: LlmClient, payload: D
             updated_at=now_ts,
             source="extract_loops",
             state=int(UnitState.RAW),
-            confidence=float(l.get("confidence") or 0.0),
+            confidence=float(confidence),
             salience=0.0,
             sensitivity=int(src_unit.sensitivity),
             pin=0,
@@ -1419,28 +1401,22 @@ def _handle_bond_summary(*, session: Session, llm_client: LlmClient, payload: Di
     input_text = f"scope_key: {scope_key}\nrange_start: {range_start}\nrange_end: {range_end}\n\n[EPISODES]\n" + "\n".join(lines)
 
     system_prompt = _wrap_prompt_with_persona(prompts.get_bond_summary_prompt())
-    resp = llm_client.generate_json_response(system_prompt=system_prompt, user_text=input_text)
-    data = json.loads(llm_client.response_content(resp))
-    summary_text = str(data.get("summary_text") or "").strip()
+    out = llm_client.generate_structured(
+        system_prompt=system_prompt,
+        user_text=input_text,
+        response_model=BondSummaryOutput,
+    )
+    summary_text = str(out.summary_text or "").strip()
     if not summary_text:
         return
-    key_events_raw = data.get("key_events") or []
     key_events: list[dict[str, Any]] = []
-    if isinstance(key_events_raw, list):
-        for item in key_events_raw:
-            if not isinstance(item, dict):
-                continue
-            why = str(item.get("why") or "").strip()
-            try:
-                unit_id = int(item.get("unit_id"))
-            except Exception:  # noqa: BLE001
-                continue
-            if not why:
-                continue
-            key_events.append({"unit_id": unit_id, "why": why})
-    key_events = key_events[:5]
+    for item in out.key_events[:5]:
+        why = str(item.why or "").strip()
+        if not why:
+            continue
+        key_events.append({"unit_id": int(item.unit_id), "why": why})
 
-    bond_state = str(data.get("bond_state") or "").strip()
+    bond_state = str(out.bond_state or "").strip()
     summary_obj = {
         "summary_text": summary_text,
         "key_events": key_events,
@@ -1713,9 +1689,12 @@ def _handle_person_summary_refresh(*, session: Session, llm_client: LlmClient, p
     )
 
     system_prompt = _wrap_prompt_with_persona(prompts.get_person_summary_prompt())
-    resp = llm_client.generate_json_response(system_prompt=system_prompt, user_text=input_text)
-    data = json.loads(llm_client.response_content(resp))
-    summary_text = str(data.get("summary_text") or "").strip()
+    out = llm_client.generate_structured(
+        system_prompt=system_prompt,
+        user_text=input_text,
+        response_model=PersonSummaryOutput,
+    )
+    summary_text = str(out.summary_text or "").strip()
     if not summary_text:
         return
 
@@ -1723,52 +1702,29 @@ def _handle_person_summary_refresh(*, session: Session, llm_client: LlmClient, p
     # - 0.5: 中立（デフォルト）
     # - 1.0: とても好意的
     # - 0.0: 強い嫌悪/不信
-    favorability_score_raw = data.get("favorability_score")
-    favorability_score = 0.5
-    if favorability_score_raw is not None:
-        try:
-            favorability_score = clamp01(float(favorability_score_raw))
-        except Exception:  # noqa: BLE001
-            favorability_score = 0.5
-
-    favorability_reasons_raw = data.get("favorability_reasons") or []
     favorability_reasons: list[dict[str, Any]] = []
-    if isinstance(favorability_reasons_raw, list):
-        for item in favorability_reasons_raw[:5]:
-            if not isinstance(item, dict):
-                continue
-            why = str(item.get("why") or "").strip()
-            try:
-                unit_id = int(item.get("unit_id"))
-            except Exception:  # noqa: BLE001
-                continue
-            if why:
-                favorability_reasons.append({"unit_id": unit_id, "why": why})
+    favorability_score = clamp01(float(out.favorability_score or 0.5))
+    for item in out.favorability_reasons[:5]:
+        why = str(item.why or "").strip()
+        if why:
+            favorability_reasons.append({"unit_id": int(item.unit_id), "why": why})
 
     # 注入テキストは Scheduler が summary_text しか使わないため、好感度も summary_text 先頭に出す。
     if "AI好感度:" not in summary_text:
         summary_text = f"AI好感度: {favorability_score:.2f}（0..1。0.5=中立）\n{summary_text}"
 
-    key_events_raw = data.get("key_events") or []
     key_events: list[dict[str, Any]] = []
-    if isinstance(key_events_raw, list):
-        for item in key_events_raw[:5]:
-            if not isinstance(item, dict):
-                continue
-            why = str(item.get("why") or "").strip()
-            try:
-                unit_id = int(item.get("unit_id"))
-            except Exception:  # noqa: BLE001
-                continue
-            if why:
-                key_events.append({"unit_id": unit_id, "why": why})
+    for item in out.key_events[:5]:
+        why = str(item.why or "").strip()
+        if why:
+            key_events.append({"unit_id": int(item.unit_id), "why": why})
 
     summary_obj = {
         "summary_text": summary_text,
         "favorability_score": favorability_score,
         "favorability_reasons": favorability_reasons,
         "key_events": key_events,
-        "notes": str(data.get("notes") or "").strip(),
+        "notes": str(out.notes or "").strip(),
     }
     summary_json = canonical_json_dumps(summary_obj)
 
@@ -1828,30 +1784,25 @@ def _handle_topic_summary_refresh(*, session: Session, llm_client: LlmClient, pa
     )
 
     system_prompt = _wrap_prompt_with_persona(prompts.get_topic_summary_prompt())
-    resp = llm_client.generate_json_response(system_prompt=system_prompt, user_text=input_text)
-    data = json.loads(llm_client.response_content(resp))
-    summary_text = str(data.get("summary_text") or "").strip()
+    out = llm_client.generate_structured(
+        system_prompt=system_prompt,
+        user_text=input_text,
+        response_model=TopicSummaryOutput,
+    )
+    summary_text = str(out.summary_text or "").strip()
     if not summary_text:
         return
 
-    key_events_raw = data.get("key_events") or []
     key_events: list[dict[str, Any]] = []
-    if isinstance(key_events_raw, list):
-        for item in key_events_raw[:5]:
-            if not isinstance(item, dict):
-                continue
-            why = str(item.get("why") or "").strip()
-            try:
-                unit_id = int(item.get("unit_id"))
-            except Exception:  # noqa: BLE001
-                continue
-            if why:
-                key_events.append({"unit_id": unit_id, "why": why})
+    for item in out.key_events[:5]:
+        why = str(item.why or "").strip()
+        if why:
+            key_events.append({"unit_id": int(item.unit_id), "why": why})
 
     summary_obj = {
         "summary_text": summary_text,
         "key_events": key_events,
-        "notes": str(data.get("notes") or "").strip(),
+        "notes": str(out.notes or "").strip(),
     }
     summary_json = canonical_json_dumps(summary_obj)
 

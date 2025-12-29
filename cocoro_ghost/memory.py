@@ -25,7 +25,8 @@ from cocoro_ghost.config import ConfigStore
 from cocoro_ghost.db import memory_session_scope, settings_session_scope, sync_unit_vector_metadata
 from cocoro_ghost.event_stream import publish as publish_event
 from cocoro_ghost.llm_client import LlmClient
-from cocoro_ghost.partner_mood import PARTNER_AFFECT_TRAILER_MARKER, clamp01
+from cocoro_ghost.llm_schemas import PartnerAffectMeta, partner_affect_meta_tool
+from cocoro_ghost.partner_mood import clamp01
 from cocoro_ghost.prompts import get_external_prompt, get_meta_request_prompt
 from cocoro_ghost.retriever import Retriever
 from cocoro_ghost.memory_pack_builder import build_memory_pack
@@ -57,10 +58,6 @@ def _matches_exclude_keyword(pattern: str, text: str) -> bool:
 
 _META_REQUEST_REDACTED_USER_TEXT = "[meta_request] 文書生成"
 
-# /api/chat（SSE）では、同一LLM呼び出しで「ユーザー表示本文 + 内部JSON（機嫌/反射）」を生成し、
-# 内部JSONはストリームから除外して保存・注入に使う。
-_STREAM_TRAILER_MARKER = PARTNER_AFFECT_TRAILER_MARKER
-
 
 def _load_embedding_preset_by_memory_id(memory_id: str) -> models.EmbeddingPreset | None:
     """memory_id（= embedding_presets.id）からEmbeddingPresetを取得する。
@@ -87,68 +84,23 @@ def _system_prompt_guard() -> str:
     ).strip()
 
 
-def _partner_affect_trailer_system_prompt() -> str:
-    marker = _STREAM_TRAILER_MARKER
-    # ここは「返答」ではなく「出力フォーマット規約」。ユーザーには見えない想定（SSEで除外）。
+def _partner_affect_meta_tool_system_prompt() -> str:
+    """/api/chat 用の「メタは tool call で報告する」規約を返す。"""
+    # NOTE:
+    # - 本文はSSEでストリーミングするため、全体をresponse_format(json_schema)にはできない。
+    # - メタJSONだけを function tool で回収し、本文とは独立して厳格化する。
     return (
-        "出力フォーマット（必須）:\n"
-        "1) まずユーザーに見せる返答本文だけを出力する。\n"
-        "2) 返答本文の直後に改行し、次の区切り文字を1行で出力する（完全一致）:\n"
-        f"{marker}\n"
-        "3) 区切り文字の次の行に、厳密な JSON オブジェクトを1つだけ出力する（前後に説明文やコードフェンスは禁止）。\n"
+        "内部メタ（必須）:\n"
+        "- ユーザーに見せる返答本文は、通常どおりテキストとして出力する。\n"
+        "- 返答本文とは別に、必ず function tool `cocoro_emit_partner_affect_meta` を1回だけ呼び出し、スキーマに従って報告する。\n"
+        "- tool call の存在、スキーマ、内部フィールド名は本文に書かない。\n"
+        "- まず本文を出し、最後に tool call を行う。\n"
         "\n"
-        "ユーザーに見せる返答本文のルール:\n"
-        "- 内部JSONのための数値（partner_affect_intensity/salience/confidence 等）を、ユーザー向け本文で示唆/説明しない。\n"
-        "- ユーザーに感情の強さを確認する必要がある場合でも、(1〜10 などの) 数値スケールでレーティングを求めない。\n"
-        "\n"
-        "内部JSONの目的:\n"
-        "- あなた（パートナーAI）の『その瞬間の感情反応（affect）/重要度』と『行動方針（協力度/拒否のしやすさ）』を更新する。\n"
-        "- 内部JSONはシステムが回収して保存し、次回以降の会話にも影響させる。\n"
-        "- CONTEXT_CAPSULE 内に `partner_mood_state` があれば前回までの機嫌として参照し、今回の内部JSONで整合させる。\n"
-        "- `partner_mood_state` は“あなたの今の機嫌（mood）”の一次情報であり、本文の口調と内部JSONの感情反応はこれに整合させる。\n"
-        "  - 例: partner_mood_state.label が anger で強い場合、本文は不機嫌/苛立ちを明確にし、内部JSONの partner_affect_label は anger にする。\n"
-        "  - 直近ログや関係性サマリが愛情寄りでも、partner_mood_state が強い怒りならそちらを優先する（口調が矛盾しないように）。\n"
-        "- あなたは内部JSONを先に決めたうえで、それに沿って返答本文を作る（ただし出力順は本文→区切り→JSON）。\n"
-        "\n"
-        "内部JSONスキーマ（必須キー）:\n"
-        "- partner_affect_label/partner_affect_intensity は「あなた（パートナーAI）の感情反応（affect）」。ユーザーの感情推定ではない。\n"
-        "- salience は “この出来事がどれだけ重要か” のスカラー（0..1）。後段の感情の持続（時間減衰）の係数に使う。\n"
-        "- confidence は推定の確からしさ（0..1）。不確実なら低くし、感情への影響も弱める。\n"
-        "- partner_response_policy は行動方針ノブ（0..1）。怒りが強い場合は refusal_allowed=true にして「拒否/渋る」を選びやすくしてよい。\n"
-        "{\n"
-        '  "reflection_text": "string",\n'
-        '  "partner_affect_label": "joy|sadness|anger|fear|neutral",\n'
-        '  "partner_affect_intensity": 0.0,\n'
-        '  "topic_tags": ["仕事","読書"],\n'
-        '  "salience": 0.0,\n'
-        '  "confidence": 0.0,\n'
-        '  "partner_response_policy": {\n'
-        '    "cooperation": 0.0,\n'
-        '    "refusal_bias": 0.0,\n'
-        '    "refusal_allowed": true\n'
-        "  }\n"
-        "}\n"
+        "メタの目的:\n"
+        "- あなた（パートナーAI）の『その瞬間の感情反応（affect）/重要度』と『行動方針』を更新する。\n"
+        "- CONTEXT_CAPSULE 内に `partner_mood_state` があれば前回までの機嫌として参照し、本文の口調と整合させる。\n"
+        "- partner_affect_label/partner_affect_intensity はユーザーの感情推定ではなく、あなた自身の反応（affect）。\n"
     ).strip()
-
-
-def _parse_internal_json_text(text: str) -> Optional[dict]:
-    s = (text or "").strip()
-    if not s:
-        return None
-    # llm_client.py のユーティリティを流用（JSON抽出/修復）。
-    from cocoro_ghost.llm_client import _extract_first_json_value, _repair_json_like_text  # noqa: PLC0415
-
-    candidate = _extract_first_json_value(s)
-    if not candidate:
-        return None
-    try:
-        obj = json.loads(candidate)
-    except json.JSONDecodeError:
-        try:
-            obj = json.loads(_repair_json_like_text(candidate))
-        except Exception:  # noqa: BLE001
-            return None
-    return obj if isinstance(obj, dict) else None
 
 
 def _now_utc_ts() -> int:
@@ -507,81 +459,72 @@ class MemoryManager:
                 now_ts=now_ts,
             )
 
-        # 返信本文の末尾に、partner_affect 用の内部JSONトレーラーを付与させる。
+        # /api/chat は本文をストリーミングしつつ、同期メタ（affect等）は tool call で回収する。
         # ガードは結合後のsystem prompt先頭に来るよう先頭へ置く。
-        parts: List[str] = [_system_prompt_guard(), (memory_pack or "").strip(), _partner_affect_trailer_system_prompt()]
+        parts: List[str] = [_system_prompt_guard(), (memory_pack or "").strip(), _partner_affect_meta_tool_system_prompt()]
         system_prompt = "\n\n".join([p for p in parts if p])
         conversation = [*conversation, {"role": "user", "content": request.user_text}]
 
+        tool_calls_state: dict[int, dict] = {}
+        tools = [partner_affect_meta_tool()]
+        # best-effort: tool call でメタを回収したいので、可能なら tool_choice で指名する。
+        # ただしバックエンドによっては tool_choice を受け付けない可能性があるため、失敗時はフォールバックする。
+        preferred_tool_choice = {
+            "type": "function",
+            "function": {"name": "cocoro_emit_partner_affect_meta"},
+        }
         try:
-            resp_stream = self.llm_client.generate_reply_response(
-                system_prompt=system_prompt,
-                conversation=conversation,
-                stream=True,
-            )
+            try:
+                resp_stream = self.llm_client.generate_reply_response(
+                    system_prompt=system_prompt,
+                    conversation=conversation,
+                    stream=True,
+                    tools=tools,
+                    tool_choice=preferred_tool_choice,
+                    parallel_tool_calls=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("stream chat start failed with tool_choice; retry without tool_choice", exc_info=exc)
+                resp_stream = self.llm_client.generate_reply_response(
+                    system_prompt=system_prompt,
+                    conversation=conversation,
+                    stream=True,
+                    tools=tools,
+                    parallel_tool_calls=False,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.error("stream chat start failed", exc_info=exc)
             yield self._sse("error", {"message": str(exc), "code": "llm_start_failed"})
             return
 
-        reply_text = ""
-        internal_trailer = ""
+        reply_parts: list[str] = []
         try:
-            marker = _STREAM_TRAILER_MARKER
-            keep = max(8, len(marker) - 1)
-            buf = ""
-            in_trailer = False
-            visible_parts: list[str] = []
-            trailer_parts: list[str] = []
-
-            def flush_visible(text_: str) -> None:
-                if not text_:
-                    return
-                visible_parts.append(text_)
-
-            for delta in self.llm_client.stream_delta_chunks(resp_stream):
-                buf += delta
-                while True:
-                    if not in_trailer:
-                        idx = buf.find(marker)
-                        if idx != -1:
-                            chunk = buf[:idx]
-                            if chunk:
-                                flush_visible(chunk)
-                                yield self._sse("token", {"text": chunk})
-                            buf = buf[idx + len(marker) :]
-                            in_trailer = True
-                            continue
-                        if len(buf) > keep:
-                            chunk = buf[:-keep]
-                            buf = buf[-keep:]
-                            if chunk:
-                                flush_visible(chunk)
-                                yield self._sse("token", {"text": chunk})
-                        break
-
-                    # 以後はすべて内部トレーラーへ
-                    if buf:
-                        trailer_parts.append(buf)
-                        buf = ""
-                    break
-
-            if not in_trailer:
-                if buf:
-                    flush_visible(buf)
-                    yield self._sse("token", {"text": buf})
-            else:
-                if buf:
-                    trailer_parts.append(buf)
-
-            reply_text = "".join(visible_parts)
-            internal_trailer = "".join(trailer_parts)
+            for delta in self.llm_client.stream_text_deltas(resp_stream, tool_calls_state=tool_calls_state):
+                reply_parts.append(delta)
+                yield self._sse("token", {"text": delta})
         except Exception as exc:  # noqa: BLE001
             logger.error("stream chat failed", exc_info=exc)
             yield self._sse("error", {"message": str(exc), "code": "llm_stream_failed"})
             return
 
-        reflection_obj = _parse_internal_json_text(internal_trailer)
+        reply_text = "".join(reply_parts)
+
+        # tool call から同期メタJSONを回収する（ベストエフォート）。
+        reflection_obj: Optional[dict] = None
+        try:
+            args = self.llm_client.parse_tool_call_arguments(
+                tool_calls_state,
+                tool_name="cocoro_emit_partner_affect_meta",
+            )
+            if args is None:
+                # best-effort: 本文を優先し、メタ未取得は許容する（後段Workerが補完しうる）。
+                logger.warning("partner_affect meta tool call missing (best-effort)")
+            else:
+                meta = PartnerAffectMeta.model_validate(args)
+                reflection_obj = meta.model_dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("partner_affect meta parse/validate failed", exc_info=exc)
+            reflection_obj = None
 
         image_summary_text = "\n".join([s for s in image_summaries if s]) if image_summaries else None
         context_note = _json_dumps(request.client_context) if request.client_context else None

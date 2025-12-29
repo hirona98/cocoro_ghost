@@ -34,14 +34,15 @@
 - `units` の `partner_affect_* / salience / confidence` に反映
 - `payload_episode.reflection_json` に保存
 
-## chat（SSE）: 返答末尾の内部JSON（partner_affect trailer）
+## chat（SSE）: tool callで回収する内部メタ（partner_affect meta）
 
-`/api/chat` は、**同一のLLM呼び出し**で「ユーザー表示本文」と「内部用の反射JSON」を同時に生成する。
+`/api/chat` は、**同一のLLM呼び出し**で「ユーザー表示本文」と「内部用のメタJSON」を同時に得る。
 
-- 返答本文の末尾に区切り文字 `<<<COCORO_GHOST_PARTNER_AFFECT_JSON_v1>>>` を出力し、その次行にJSONを1つだけ出力する
-- サーバ側は区切り以降をSSEに流さず回収し、Episodeへ即時反映する（`cocoro_ghost/memory.py`）
+- 本文: 通常の返答本文（テキスト）を SSE でストリームする
+- メタ: **原則として** function tool `cocoro_emit_partner_affect_meta` を1回だけ呼び出させ、`arguments` をサーバ側で回収してEpisodeへ即時反映する（`cocoro_ghost/memory.py`）
+  - モデル/バックエンド都合で tool call が出ない・壊れる可能性はゼロにできないため、サーバ側の回収は best-effort とする（本文SSEを優先）。
 
-### 出力JSON（partner_affect trailer）
+### メタJSON（partner_affect meta）
 
 ```json
 {
@@ -106,6 +107,7 @@
 
 - 保存は `units(kind=FACT)` + `payload_fact`
 - `payload_fact.evidence_unit_ids_json` に元 episode の `unit_id` を必ず含める
+- `validity.from/to` は UNIX秒（int）または `null`
 
 ## OpenLoops抽出
 
@@ -121,6 +123,7 @@
 
 - 保存は `units(kind=LOOP)` + `payload_loop`
 - Close条件（任意）：次回会話で完了したと判断したら `status=closed` 更新（版管理で差分）
+- `due_at` は UNIX秒（int）または `null`
 
 ## Bond Summary（絆サマリ）
 

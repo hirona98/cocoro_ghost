@@ -3,8 +3,12 @@
 LiteLLM ラッパー。
 
 LLM API 呼び出しを抽象化するクライアントクラス。
-現状は `litellm.completion()`（OpenAI の chat.completions 互換の messages 形式）を中心に利用する。
+現状は `litellm.completion()`（OpenAI の chat.completions 互換）を中心に利用する。
 会話生成、JSON 生成、埋め込みベクトル生成、画像認識をサポートする。
+
+設計方針:
+- JSONとして扱う出力は Structured Outputs（json_schema / strict）で受け取り、後段で修復しない
+- /api/chat の本文はストリームしつつ、同期メタは tool call（function calling）で回収する
 """
 
 from __future__ import annotations
@@ -13,9 +17,10 @@ import base64
 import json
 import logging
 import re
-from typing import Any, Dict, Generator, Iterable, List, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional, Type, TypeVar
 
 import litellm
+from pydantic import BaseModel
 
 
 def _truncate_for_log(text: str, limit: int) -> str:
@@ -82,143 +87,26 @@ def _delta_content(resp: Any) -> str:
         return ""
 
 
-# コードフェンス検出用正規表現
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+def _stream_delta_tool_calls(resp: Any) -> list[dict]:
+    """ストリーミングチャンクから tool_calls を取り出す。
 
-
-def _strip_code_fences(text: str) -> str:
-    """```json ... ```のようなフェンスがあれば中身だけを取り出す。"""
-    if not text:
-        return ""
-    m = _JSON_FENCE_RE.search(text)
-    return m.group(1) if m else text
-
-
-def _extract_first_json_value(text: str) -> str:
+    OpenAI互換の delta.tool_calls（function calling）の断片が入ってくる。
+    ここでは「断片をそのまま返す」だけにし、結合は呼び出し側で行う。
     """
-    文字列から最初のJSON値（object/array）らしき部分を抜き出す。
-    LLMが出力した「ほぼJSON」から有効な部分を抽出する。
-    """
-    text = _strip_code_fences(text).strip()
-    if not text:
-        return ""
-
-    # { か [ の最初の出現位置を探す
-    obj_i = text.find("{")
-    arr_i = text.find("[")
-    if obj_i == -1 and arr_i == -1:
-        return text
-
-    # 開始文字と閉じ文字を決定
-    if obj_i == -1:
-        start = arr_i
-        open_ch, close_ch = "[", "]"
-    elif arr_i == -1:
-        start = obj_i
-        open_ch, close_ch = "{", "}"
-    else:
-        start = obj_i if obj_i < arr_i else arr_i
-        open_ch, close_ch = ("{", "}") if start == obj_i else ("[", "]")
-
-    # 対応する閉じ括弧を探す（文字列内を考慮）
-    depth = 0
-    in_string = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                escaped = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == open_ch:
-            depth += 1
-            continue
-        if ch == close_ch:
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-
-    return text[start:]
-
-
-def _escape_control_chars_in_json_strings(text: str) -> str:
-    """
-    JSON文字列内に混入した生の改行/タブ等をエスケープする。
-    LLMが出力した不正なJSONを修復するために使用。
-    """
-    if not text:
-        return ""
-    out: list[str] = []
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                out.append(ch)
-                escaped = False
-                continue
-            if ch == "\\":
-                out.append(ch)
-                escaped = True
-                continue
-            if ch == '"':
-                out.append(ch)
-                in_string = False
-                continue
-            # 制御文字をエスケープ
-            if ch == "\n":
-                out.append("\\n")
-                continue
-            if ch == "\r":
-                out.append("\\r")
-                continue
-            if ch == "\t":
-                out.append("\\t")
-                continue
-            out.append(ch)
-            continue
-
-        if ch == '"':
-            in_string = True
-        out.append(ch)
-    return "".join(out)
-
-
-def _repair_json_like_text(text: str) -> str:
-    """
-    LLMが生成しがちな「ほぼJSON」を、最低限パースできるように整形する。
-    スマートクォートの置換、制御文字のエスケープ、末尾カンマの除去を行う。
-    """
-    if not text:
-        return ""
-    s = text.strip()
-    # スマートクォート対策
-    s = s.replace(""", '"').replace(""", '"')
-    # 文字列内の改行/タブ等
-    s = _escape_control_chars_in_json_strings(s)
-    # 末尾カンマ
-    s = re.sub(r",\s*([}\]])", r"\1", s)
-    return s
-
-
-def _finish_reason(resp: Any) -> str:
-    """レスポンスからfinish_reasonを取得する。"""
     try:
         choice = resp.choices[0]
-        finish_reason = getattr(choice, "finish_reason", None) or choice.get("finish_reason")
-        return str(finish_reason or "")
+        delta = getattr(choice, "delta", None) or choice.get("delta")
+        if not delta:
+            return []
+        tool_calls = getattr(delta, "tool_calls", None) or delta.get("tool_calls")
+        if not tool_calls:
+            return []
+        return list(tool_calls) if isinstance(tool_calls, list) else []
     except Exception:  # noqa: BLE001
-        return ""
+        return []
+
+
+T_Model = TypeVar("T_Model", bound=BaseModel)
 
 
 class LlmClient:
@@ -288,7 +176,11 @@ class LlmClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        response_format: Optional[Dict] = None,
+        response_format: Optional[object] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[object] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        extra_body: Optional[dict] = None,
         timeout: Optional[int] = None,
         stream: bool = False,
     ) -> Dict:
@@ -321,14 +213,26 @@ class LlmClient:
             kwargs["api_base"] = base_url
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
-        if response_format:
+        if response_format is not None:
             kwargs["response_format"] = response_format
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = bool(parallel_tool_calls)
         if timeout:
             kwargs["timeout"] = timeout
 
-        # reasoning_effort対応（OpenAI o1系など）
+        # extra_body（OpenAI系の追加パラメータ）
+        # - reasoning_effort 等はここへ載せる（既存の extra_body があればマージする）
+        extra_body_obj: dict = {}
         if self.reasoning_effort:
-            kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
+            extra_body_obj["reasoning_effort"] = self.reasoning_effort
+        if extra_body:
+            extra_body_obj.update(dict(extra_body))
+        if extra_body_obj:
+            kwargs["extra_body"] = extra_body_obj
 
         return kwargs
 
@@ -338,6 +242,9 @@ class LlmClient:
         conversation: List[Dict[str, str]],
         temperature: float = 0.7,
         stream: bool = False,
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[object] = None,
+        parallel_tool_calls: Optional[bool] = None,
     ):
         """
         会話応答を生成する（Responseオブジェクト or ストリーム）。
@@ -358,57 +265,24 @@ class LlmClient:
             base_url=self.llm_base_url,
             max_tokens=self.max_tokens,
             stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
         resp = litellm.completion(**kwargs)
         return resp
 
-    def generate_reflection_response(
-        self,
-        system_prompt: str,
-        context_text: str,
-        image_descriptions: Optional[List[str]] = None,
-    ):
-        """
-        内的思考（リフレクション）を生成する（Responseオブジェクト）。
-        コンテキストに基づいてJSON形式の思考結果を返す。
-        """
-        # コンテキストブロックを構築
-        context_block = context_text
-        if image_descriptions:
-            context_block += "\n" + "\n".join(image_descriptions)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context_block},
-        ]
-
-        self.logger.info("LLM reflection", extra={"model": self.model})
-
-        kwargs = self._build_completion_kwargs(
-            model=self.model,
-            messages=messages,
-            temperature=0.1,  # リフレクションは低温度で安定性重視
-            api_key=self.api_key,
-            base_url=self.llm_base_url,
-            max_tokens=self.max_tokens,
-            response_format={"type": "json_object"},
-        )
-
-        return litellm.completion(**kwargs)
-
-    def generate_json_response(
+    def generate_structured(
         self,
         *,
         system_prompt: str,
         user_text: str,
+        response_model: Type[T_Model],
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
-    ):
-        """
-        JSON（json_object）を生成する（Responseオブジェクト）。
-        構造化データの抽出や分析結果の出力に使用する。
-        """
+    ) -> T_Model:
+        """Structured Outputs（json_schema/strict）でJSONを生成し、Pydanticモデルにして返す。"""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
@@ -422,11 +296,23 @@ class LlmClient:
             api_key=self.api_key,
             base_url=self.llm_base_url,
             max_tokens=requested_max_tokens,
-            response_format={"type": "json_object"},
+            # LiteLLMは pydantic.BaseModel を response_format として受け取れる（json_schema(strict)へ変換される）。
+            response_format=response_model,
         )
 
         resp = litellm.completion(**kwargs)
-        return resp
+        content = self.response_content(resp)
+        try:
+            return response_model.model_validate_json(content)
+        except Exception as exc:  # noqa: BLE001
+            # Structured Outputsのはずだが、失敗時はログに残して即時に落とす（修復しない）。
+            self.logger.error(
+                "LLM structured output parse failed",
+                extra={"model": self.model, "schema": getattr(response_model, "__name__", str(response_model))},
+                exc_info=exc,
+            )
+            self.logger.debug("LLM structured output content: %s", _truncate_for_log(content, self._DEBUG_PREVIEW_CHARS))
+            raise
 
     def generate_embedding(
         self,
@@ -502,59 +388,87 @@ class LlmClient:
         """Responseから本文（choices[0].message.content）を取り出す。"""
         return _first_choice_content(resp)
 
-    def response_json(self, resp: Any) -> Any:
-        """
-        LLM応答本文からJSONを抽出・修復しつつパースする。
-        LLMが出力した不正なJSONも可能な限り修復してパースを試みる。
-        """
-        content = self.response_content(resp)
-        candidate = _extract_first_json_value(content)
-        if not candidate:
-            raise ValueError("empty LLM content for JSON parsing")
+    def stream_text_deltas(
+        self,
+        resp_stream: Iterable[Any],
+        *,
+        tool_calls_state: Optional[dict[int, dict]] = None,
+    ) -> Generator[str, None, None]:
+        """ストリーミング応答から本文（delta.content）だけを逐次yieldする。
 
-        # まず通常のパースを試行
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as exc1:
-            # 失敗した場合は修復を試みる
-            repaired = _repair_json_like_text(candidate)
-            try:
-                parsed = json.loads(repaired)
-                self.logger.warning(
-                    "LLM JSON parse failed; parsed after repair (finish_reason=%s, error=%s)",
-                    _finish_reason(resp),
-                    exc1,
-                )
-                return parsed
-            except json.JSONDecodeError as exc:
-                # 失敗時はデバッグ用に内容を残す
-                self.logger.debug("response_json parse failed: %s", exc)
-                self.logger.debug("response_json content (raw): %s", _truncate_for_log(content, self._DEBUG_PREVIEW_CHARS))
-                self.logger.debug("response_json candidate: %s", _truncate_for_log(candidate, self._DEBUG_PREVIEW_CHARS))
-                self.logger.debug("response_json repaired: %s", _truncate_for_log(repaired, self._DEBUG_PREVIEW_CHARS))
-                raise
-
-    def stream_delta_chunks(self, resp_stream: Iterable[Any]) -> Generator[str, None, None]:
+        /api/chat では本文をSSEで流したい一方で、同期メタJSONは tool call で回収する。
+        そのため、tool call の断片は `tool_calls_state` に蓄積し、本文はyieldで返す。
         """
-        LiteLLMのstreaming Responseからdelta.contentを逐次抽出する。
-        ストリーミング応答をリアルタイムで処理するジェネレータ。
-        """
-        parts: List[str] = []
         for chunk in resp_stream:
+            if tool_calls_state is not None:
+                self._accumulate_stream_tool_calls(tool_calls_state, chunk)
             delta = _delta_content(chunk)
             if delta:
-                parts.append(delta)
                 yield delta
 
-    def generate_reflection(
-        self,
-        system_prompt: str,
-        context_text: str,
-        image_descriptions: Optional[List[str]] = None,
-    ) -> str:
-        """
-        reflection用のJSON応答を生成し、本文文字列だけ返す（薄いラッパー）。
-        generate_reflection_responseの結果から本文のみを抽出する。
-        """
-        resp = self.generate_reflection_response(system_prompt, context_text, image_descriptions)
-        return self.response_content(resp)
+    def parse_tool_call_arguments(self, tool_calls_state: dict[int, dict], *, tool_name: str) -> Optional[dict]:
+        """蓄積した tool call から、指定ツールの arguments を JSON として取り出す。"""
+        if not tool_calls_state:
+            return None
+        # index順で安定させる（最後に来たものを優先）
+        for _idx in sorted(tool_calls_state.keys(), reverse=True):
+            tc = tool_calls_state.get(_idx) or {}
+            if str(tc.get("name") or "") != str(tool_name):
+                continue
+            args_text = str(tc.get("arguments") or "").strip()
+            if not args_text:
+                return None
+            try:
+                return json.loads(args_text)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(
+                    "tool call arguments parse failed",
+                    extra={"tool_name": tool_name},
+                    exc_info=exc,
+                )
+                self.logger.debug("tool call arguments(raw): %s", _truncate_for_log(args_text, self._DEBUG_PREVIEW_CHARS))
+                return None
+        return None
+
+    @staticmethod
+    def _accumulate_stream_tool_calls(tool_calls_state: dict[int, dict], chunk: Any) -> None:
+        """streamの tool_calls 断片を結合して tool_calls_state へ蓄積する。"""
+
+        def _to_dict(obj: Any) -> dict:
+            if obj is None:
+                return {}
+            if isinstance(obj, dict):
+                return obj
+            if hasattr(obj, "model_dump"):
+                try:
+                    return obj.model_dump()
+                except Exception:  # noqa: BLE001
+                    return {}
+            if hasattr(obj, "dict"):
+                try:
+                    return obj.dict()
+                except Exception:  # noqa: BLE001
+                    return {}
+            try:
+                return dict(obj)
+            except Exception:  # noqa: BLE001
+                return {}
+
+        for tc_raw in _stream_delta_tool_calls(chunk):
+            tc = _to_dict(tc_raw)
+            try:
+                idx = int(tc.get("index"))
+            except Exception:  # noqa: BLE001
+                continue
+
+            entry = tool_calls_state.get(idx) or {"id": None, "name": None, "arguments": ""}
+            if tc.get("id"):
+                entry["id"] = tc.get("id")
+
+            fn = _to_dict(tc.get("function"))
+            if fn.get("name"):
+                entry["name"] = fn.get("name")
+            if fn.get("arguments"):
+                entry["arguments"] = str(entry.get("arguments") or "") + str(fn.get("arguments") or "")
+
+            tool_calls_state[idx] = entry

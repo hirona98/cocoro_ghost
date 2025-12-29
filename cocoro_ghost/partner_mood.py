@@ -4,7 +4,7 @@
 会話における「機嫌の反映」を実現するための中核ロジック。
 
 ここでいう機嫌は2つの性質を持つ:
-- 即時性: /api/chat の内部JSON（reflection）でpartner_affect_*を即時更新
+- 即時性: /api/chat の内部メタ（tool call）でpartner_affect_*を即時更新
 - 持続性: 過去エピソードの影響を「重要度×時間減衰」で積分し、現在状態を推定
 
 計算式: impact = intensity × salience × confidence × exp(-Δt/τ)
@@ -18,10 +18,6 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
-
-# /api/chat（SSE）で返答本文の末尾に付与する区切り文字。
-# ここより後ろのJSONはサーバ側で回収し、SSEには流さない。
-PARTNER_AFFECT_TRAILER_MARKER = "<<<COCORO_GHOST_PARTNER_AFFECT_JSON_v1>>>"
 
 # partner_mood_state のラベル（喜怒哀楽 + neutral）。
 PARTNER_MOOD_LABELS = ("joy", "sadness", "anger", "fear", "neutral")

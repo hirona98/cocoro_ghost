@@ -22,6 +22,8 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Type, TypeVar
 import litellm
 from pydantic import BaseModel
 
+from cocoro_ghost.llm_debug import log_llm_payload
+
 
 def _truncate_for_log(text: str, limit: int) -> str:
     """ログ出力用にテキストを切り詰める。"""
@@ -168,6 +170,33 @@ class LlmClient:
         self.max_tokens_vision = max_tokens_vision
         self.image_timeout_seconds = image_timeout_seconds
 
+    def _log_llm_send(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        model: str,
+        stream: bool,
+    ) -> None:
+        """LLM送信ログを出す。"""
+        # INFOは送受信の到達点だけを出す
+        self.logger.info("LLMに送信", extra={"model": model, "stream": stream, "kind": kind})
+        if self.logger.isEnabledFor(logging.DEBUG):
+            log_llm_payload(self.logger, f"LLM request ({kind})", payload)
+
+    def _log_llm_recv(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        model: str,
+        stream: bool,
+    ) -> None:
+        """LLM受信ログを出す。"""
+        self.logger.info("LLMから受信", extra={"model": model, "stream": stream, "kind": kind})
+        if self.logger.isEnabledFor(logging.DEBUG):
+            log_llm_payload(self.logger, f"LLM response ({kind})", payload)
+
     def _build_completion_kwargs(
         self,
         model: str,
@@ -255,8 +284,6 @@ class LlmClient:
         for m in conversation:
             messages.append({"role": m["role"], "content": m["content"]})
 
-        self.logger.info("LLM reply", extra={"model": self.model, "stream": stream})
-
         kwargs = self._build_completion_kwargs(
             model=self.model,
             messages=messages,
@@ -269,8 +296,10 @@ class LlmClient:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
-
+        self._log_llm_send(kind="chat", payload=kwargs, model=self.model, stream=stream)
         resp = litellm.completion(**kwargs)
+        if not stream:
+            self._log_llm_recv(kind="chat", payload=self.response_to_dict(resp), model=self.model, stream=stream)
         return resp
 
     def generate_structured(
@@ -299,8 +328,9 @@ class LlmClient:
             # LiteLLMは pydantic.BaseModel を response_format として受け取れる（json_schema(strict)へ変換される）。
             response_format=response_model,
         )
-
+        self._log_llm_send(kind="structured", payload=kwargs, model=self.model, stream=False)
         resp = litellm.completion(**kwargs)
+        self._log_llm_recv(kind="structured", payload=self.response_to_dict(resp), model=self.model, stream=False)
         content = self.response_content(resp)
         try:
             return response_model.model_validate_json(content)
@@ -323,11 +353,6 @@ class LlmClient:
         テキストの埋め込みベクトルを生成する。
         複数テキストを一括処理し、各テキストに対応するベクトルを返す。
         """
-        self.logger.info(
-            "LLM embedding",
-            extra={"model": self.embedding_model, "count": len(texts)},
-        )
-
         kwargs = {
             "model": self.embedding_model,
             "input": texts,
@@ -337,7 +362,9 @@ class LlmClient:
         if self.embedding_base_url:
             kwargs["api_base"] = self.embedding_base_url
 
+        self._log_llm_send(kind="embedding", payload=kwargs, model=self.embedding_model, stream=False)
         resp = litellm.embedding(**kwargs)
+        self._log_llm_recv(kind="embedding", payload=self.response_to_dict(resp), model=self.embedding_model, stream=False)
 
         # レスポンス形式に応じてベクトルを抽出
         try:
@@ -374,8 +401,9 @@ class LlmClient:
                 max_tokens=self.max_tokens_vision,
                 timeout=self.image_timeout_seconds,
             )
-
+            self._log_llm_send(kind="image_summary", payload=kwargs, model=self.image_model, stream=False)
             resp = litellm.completion(**kwargs)
+            self._log_llm_recv(kind="image_summary", payload=self.response_to_dict(resp), model=self.image_model, stream=False)
             summaries.append(_first_choice_content(resp))
 
         return summaries
@@ -393,18 +421,25 @@ class LlmClient:
         resp_stream: Iterable[Any],
         *,
         tool_calls_state: Optional[dict[int, dict]] = None,
+        kind: str = "chat",
+        model: Optional[str] = None,
     ) -> Generator[str, None, None]:
         """ストリーミング応答から本文（delta.content）だけを逐次yieldする。
 
         /api/chat では本文をSSEで流したい一方で、同期メタJSONは tool call で回収する。
         そのため、tool call の断片は `tool_calls_state` に蓄積し、本文はyieldで返す。
         """
+        collected: list[str] = []
         for chunk in resp_stream:
             if tool_calls_state is not None:
                 self._accumulate_stream_tool_calls(tool_calls_state, chunk)
             delta = _delta_content(chunk)
             if delta:
+                collected.append(delta)
                 yield delta
+        # ストリーム完了時に受信ログを出す
+        full_text = "".join(collected)
+        self._log_llm_recv(kind=kind, payload={"content": full_text}, model=model or self.model, stream=True)
 
     def parse_tool_call_arguments(self, tool_calls_state: dict[int, dict], *, tool_name: str) -> Optional[dict]:
         """蓄積した tool call から、指定ツールの arguments を JSON として取り出す。"""

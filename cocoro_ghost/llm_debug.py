@@ -7,7 +7,7 @@ LLMクライアント実装から独立しており、任意の箇所に差し�
 主な機能:
 - JSONっぽい文字列の補正とパース（フェンス除去、末尾カンマ修正等）
 - 秘匿情報（api_key、token等）のマスク
-- 環境変数 COCORO_LLM_IO_DEBUG=1 で強制出力
+- 長いbase64の省略（ログ肥大化を防ぐ）
 
 使い方例:
     from cocoro_ghost.llm_debug import log_llm_payload
@@ -18,7 +18,7 @@ LLMクライアント実装から独立しており、任意の箇所に差し�
 from __future__ import annotations
 
 import json
-import os
+import logging
 import re
 from dataclasses import asdict, is_dataclass
 from typing import Any, Iterable
@@ -38,11 +38,6 @@ _DEFAULT_REDACT_KEYS = {
 }
 
 
-def _truthy_env(name: str) -> bool:
-    """環境変数の真偽値っぽい値を解釈する。"""
-    v = (os.getenv(name) or "").strip().lower()
-    return v in {"1", "true", "yes", "on"}
-
 
 def _truncate_for_log(text: str, limit: int) -> str:
     """ログ向けに文字数を制限する。"""
@@ -54,6 +49,16 @@ def _truncate_for_log(text: str, limit: int) -> str:
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+_DATA_URL_BASE64_RE = re.compile(r"^data:([^;]+);base64,", re.IGNORECASE)
+_BASE64_CHARS_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _looks_like_base64(text: str) -> bool:
+    """ログ肥大化を防ぐため、長いbase64っぽい文字列を検出する。"""
+    cleaned = re.sub(r"\s+", "", text)
+    if len(cleaned) < 200:
+        return False
+    return bool(_BASE64_CHARS_RE.fullmatch(cleaned))
 
 
 def _strip_code_fences(text: str) -> str:
@@ -246,6 +251,13 @@ def redact_secrets(
         # 文字列のAuthorization: Bearer ... 等は丸ごとマスク
         if isinstance(v, str):
             s = v
+            # data URL(base64)は巨大になりやすいので省略する
+            m = _DATA_URL_BASE64_RE.match(s)
+            if m:
+                mime = m.group(1)
+                return f"data:{mime};base64,[omitted]"
+            if _looks_like_base64(s):
+                return "[base64 omitted]"
             if re.search(r"\bBearer\s+\S+", s, re.IGNORECASE):
                 return re.sub(r"\bBearer\s+\S+", "Bearer ***", s, flags=re.IGNORECASE)
             return s
@@ -304,8 +316,7 @@ def log_llm_payload(
 ) -> None:
     """LLMの送受信payloadをlogger.debugで出す。
 
-    - COCORO_LLM_IO_DEBUG=1 なら強制的に出力
-    - それ以外は logger が DEBUG のときだけ出す
+    - logger が DEBUG のときだけ出す
 
     loggerは標準loggingのLogger互換（debug/info等）を想定。
     """
@@ -313,15 +324,14 @@ def log_llm_payload(
     if logger is None:
         return
 
-    force = _truthy_env("COCORO_LLM_IO_DEBUG")
     enabled_by_level = False
     try:
-        enabled_by_level = bool(getattr(logger, "isEnabledFor")(10))  # logging.DEBUG == 10
+        enabled_by_level = bool(getattr(logger, "isEnabledFor")(logging.DEBUG))
     except Exception:
         # logger互換でなくても落とさない
         enabled_by_level = False
 
-    if not (force or enabled_by_level):
+    if not enabled_by_level:
         return
 
     text = format_debug_payload(payload, max_chars=max_chars)

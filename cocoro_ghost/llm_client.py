@@ -340,7 +340,7 @@ class LlmClient:
         try:
             return response_model.model_validate_json(content)
         except Exception as exc:  # noqa: BLE001
-            # Structured Outputsのはずだが、失敗時はログに残して即時に落とす（修復しない）。
+            # JSON出力のはずだが、失敗時はログに残して即時に落とす（修復しない）。
             self.logger.error(
                 "LLM structured output parse failed",
                 extra={"model": self.model, "schema": getattr(response_model, "__name__", str(response_model))},

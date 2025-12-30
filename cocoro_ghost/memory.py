@@ -128,6 +128,18 @@ def _partner_affect_meta_tool_system_prompt() -> str:
     ).strip()
 
 
+_TOOL_CALL_MARKERS = ("cocoro_emit_partner_affect_meta", "default_api.cocoro_emit_partner_affect_meta")
+
+
+def _strip_tool_call_text(line: str) -> tuple[str, bool]:
+    """tool callの混入テキストを除去する。"""
+    if not line:
+        return "", False
+    if any(marker in line for marker in _TOOL_CALL_MARKERS):
+        return "", True
+    return line, False
+
+
 def _now_utc_ts() -> int:
     """現在時刻（UTC）をUNIX秒で返す。"""
     return int(time.time())
@@ -490,7 +502,11 @@ class MemoryManager:
         system_prompt = "\n\n".join([p for p in parts if p])
         conversation = [*conversation, {"role": "user", "content": request.user_text}]
 
-        tool_calls_state: dict[int, dict] = {}
+        # stream本文（SSE）と tool call（同期メタ）を同時に回収する。
+        # Gemini系は tool_choice を function に固定すると「本文なし（tool call のみ）」になり得るため、
+        # その場合は【メタは保持したまま】本文だけ tool_choice なしで再取得する。
+        tool_calls_state_primary: dict[int, dict] = {}
+        tool_calls_state_secondary: dict[int, dict] = {}
         tools = [partner_affect_meta_tool()]
         # best-effort: tool call でメタを回収したいので、可能なら tool_choice で指名する。
         # ただしバックエンドによっては tool_choice を受け付けない可能性があるため、失敗時はフォールバックする。
@@ -523,10 +539,56 @@ class MemoryManager:
             return
 
         reply_parts: list[str] = []
+
+        def _stream_and_collect(resp_stream_obj, *, tool_calls_state: dict[int, dict]):
+            """ストリーム本文を収集しつつSSEで配信する。"""
+            line_buffer = ""
+            for delta in self.llm_client.stream_text_deltas(resp_stream_obj, tool_calls_state=tool_calls_state):
+                line_buffer += delta
+                while "\n" in line_buffer:
+                    line, line_buffer = line_buffer.split("\n", 1)
+                    safe_line, removed = _strip_tool_call_text(line)
+                    if removed and not safe_line:
+                        continue
+                    text = f"{safe_line}\n"
+                    reply_parts.append(text)
+                    yield self._sse("token", {"text": text})
+            if line_buffer:
+                safe_tail, removed = _strip_tool_call_text(line_buffer)
+                if not (removed and not safe_tail):
+                    reply_parts.append(safe_tail)
+                    yield self._sse("token", {"text": safe_tail})
+
         try:
-            for delta in self.llm_client.stream_text_deltas(resp_stream, tool_calls_state=tool_calls_state):
-                reply_parts.append(delta)
-                yield self._sse("token", {"text": delta})
+            # まずは tool_choice あり（ベストエフォート）で開始する。
+            for event in _stream_and_collect(resp_stream, tool_calls_state=tool_calls_state_primary):
+                yield event
+
+            # 本文が空でも tool call（メタ）だけ返ってくるケースがある。
+            # - メタが取れているなら保持して、本文だけ tool_choice なしで再取得
+            # - メタも取れていないなら従来どおり再試行
+            if not "".join(reply_parts).strip():
+                args_primary = self.llm_client.parse_tool_call_arguments(
+                    tool_calls_state_primary,
+                    tool_name="cocoro_emit_partner_affect_meta",
+                )
+                if args_primary is not None:
+                    logger.warning("stream chat returned tool-call-only; retry for content without tool_choice")
+                else:
+                    logger.warning("stream chat empty response; retry without tool_choice")
+
+                # 本文だけ再収集するので、reply_partsはリセットする（tool_calls_state_primaryは保持）。
+                reply_parts.clear()
+                tool_calls_state_secondary.clear()
+                resp_stream = self.llm_client.generate_reply_response(
+                    system_prompt=system_prompt,
+                    conversation=conversation,
+                    stream=True,
+                    tools=tools,
+                    parallel_tool_calls=False,
+                )
+                for event in _stream_and_collect(resp_stream, tool_calls_state=tool_calls_state_secondary):
+                    yield event
         except Exception as exc:  # noqa: BLE001
             logger.error("stream chat failed", exc_info=exc)
             yield self._sse("error", {"message": str(exc), "code": "llm_stream_failed"})
@@ -537,10 +599,10 @@ class MemoryManager:
         # tool call から同期メタJSONを回収する（ベストエフォート）。
         reflection_obj: Optional[dict] = None
         try:
-            args = self.llm_client.parse_tool_call_arguments(
-                tool_calls_state,
-                tool_name="cocoro_emit_partner_affect_meta",
-            )
+            # まずは tool_choice ありの結果を優先し、なければ再試行側を参照する。
+            args = self.llm_client.parse_tool_call_arguments(tool_calls_state_primary, tool_name="cocoro_emit_partner_affect_meta")
+            if args is None:
+                args = self.llm_client.parse_tool_call_arguments(tool_calls_state_secondary, tool_name="cocoro_emit_partner_affect_meta")
             if args is None:
                 # best-effort: 本文を優先し、メタ未取得は許容する（後段Workerが補完しうる）。
                 logger.warning("partner_affect meta tool call missing (best-effort)")
